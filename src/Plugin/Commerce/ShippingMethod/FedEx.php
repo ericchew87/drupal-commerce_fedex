@@ -11,11 +11,13 @@ use Drupal\commerce_fedex\FedExRequestInterface;
 use Drupal\commerce_fedex\FedExPluginManager;
 use Drupal\commerce_price\Price;
 use Drupal\commerce_price\RounderInterface;
+use Drupal\commerce_shipping\Entity\PackageInterface;
 use Drupal\commerce_shipping\Entity\ShipmentInterface;
 use Drupal\commerce_shipping\PackageTypeManagerInterface;
 use Drupal\commerce_shipping\Plugin\Commerce\PackageType\PackageTypeInterface;
 use Drupal\commerce_shipping\Plugin\Commerce\ShippingMethod\ShippingMethodBase;
 use Drupal\commerce_shipping\ShipmentItem;
+use Drupal\commerce_shipping\ShipmentPackagerManager;
 use Drupal\commerce_shipping\ShippingRate;
 use Drupal\Core\Form\SubformState;
 use Drupal\Core\Plugin\DefaultLazyPluginCollection;
@@ -158,8 +160,8 @@ class FedEx extends ShippingMethodBase {
    * @param \Drupal\commerce_price\RounderInterface $rounder
    *   The price rounder.
    */
-  public function __construct(array $configuration, $plugin_id, $plugin_definition, PackageTypeManagerInterface $package_type_manager, FedExPluginManager $fedex_service_manager, EventDispatcherInterface $event_dispatcher, FedExRequestInterface $fedex_request, LoggerInterface $watchdog, RounderInterface $rounder) {
-    parent::__construct($configuration, $plugin_id, $plugin_definition, $package_type_manager);
+  public function __construct(array $configuration, $plugin_id, $plugin_definition, PackageTypeManagerInterface $package_type_manager, ShipmentPackagerManager $shipment_packager_manager, FedExPluginManager $fedex_service_manager, EventDispatcherInterface $event_dispatcher, FedExRequestInterface $fedex_request, LoggerInterface $watchdog, RounderInterface $rounder) {
+    parent::__construct($configuration, $plugin_id, $plugin_definition, $package_type_manager, $shipment_packager_manager);
     $this->watchdog = $watchdog;
     $this->fedExRequest = $fedex_request;
     $this->fedExServiceManager = $fedex_service_manager;
@@ -181,6 +183,7 @@ class FedEx extends ShippingMethodBase {
       $plugin_id,
       $plugin_definition,
       $container->get('plugin.manager.commerce_package_type'),
+      $container->get('plugin.manager.commerce_shipment_packager'),
       $container->get('plugin.manager.commerce_fedex_service'),
       $container->get('event_dispatcher'),
       $container->get('commerce_fedex.fedex_request'),
@@ -446,6 +449,8 @@ class FedEx extends ShippingMethodBase {
       return [];
     }
 
+    $this->packageShipment($shipment);
+
     $rate_service = $this->fedExRequest->getRateService($this->configuration);
     $rate_request = $this->getRateRequest($rate_service, $shipment);
     $this->logRequest('Sending FedEx request.', $rate_request);
@@ -507,6 +512,11 @@ class FedEx extends ShippingMethodBase {
     }
 
     return $rates;
+  }
+
+  public function selectRate(ShipmentInterface $shipment, ShippingRate $rate) {
+    parent::selectRate($shipment, $rate);
+    $this->packageShipment($shipment);
   }
 
   /**
@@ -602,20 +612,47 @@ class FedEx extends ShippingMethodBase {
    *   The requested package line items.
    */
   protected function getRequestedPackageLineItems(ShipmentInterface $shipment) {
+//    $requested_package_line_items = [];
+//
+//    switch ($this->configuration['options']['packaging']) {
+//      case static::PACKAGE_ALL_IN_ONE:
+//        $requested_package_line_items = $this->getRequestedPackageLineItemsAllInOne($shipment);
+//        break;
+//
+//      case static::PACKAGE_INDIVIDUAL:
+//        $requested_package_line_items = $this->getRequestedPackageLineItemsIndividual($shipment);
+//        break;
+//
+//      case static::PACKAGE_CALCULATE:
+//        $requested_package_line_items = $this->getRequestedPackageLineItemsCalculate($shipment);
+//        break;
+//    }
+
     $requested_package_line_items = [];
+    $weightUnits = '';
+    foreach ($shipment->getPackages() as $delta => $package) {
+      $requested_package_line_item = new RequestedPackageLineItem();
+      if ($weightUnits == '') {
+        /* All packages must have the same Weight Unit */
+        $weightUnits = $package->getWeight()->getUnit();
+      }
 
-    switch ($this->configuration['options']['packaging']) {
-      case static::PACKAGE_ALL_IN_ONE:
-        $requested_package_line_items = $this->getRequestedPackageLineItemsAllInOne($shipment);
-        break;
+      $requested_package_line_item
+        ->setSequenceNumber($delta + 1)
+        ->setGroupPackageCount(1)
+        ->setWeight($this->physicalWeightToFedex($package->getWeight()->convert($weightUnits)))
+        ->setDimensions($this->packageToFedexDimensions($package->getPackageType()))
+        ->setPhysicalPackaging(PhysicalPackagingType::VALUE_BOX)
+        ->setItemDescription($this->getCleanTitle($package));
 
-      case static::PACKAGE_INDIVIDUAL:
-        $requested_package_line_items = $this->getRequestedPackageLineItemsIndividual($shipment);
-        break;
-
-      case static::PACKAGE_CALCULATE:
-        $requested_package_line_items = $this->getRequestedPackageLineItemsCalculate($shipment);
-        break;
+      if ($this->configuration['options']['insurance']) {
+        $requested_package_line_item->setInsuredValue(new Money(
+          $package->getDeclaredValue()->getCurrencyCode(),
+          $package->getDeclaredValue()->getNumber()
+        ));
+      }
+      $this->adjustPackage($requested_package_line_item, [$package], $shipment);
+      $requested_package_line_items[] = $requested_package_line_item;
     }
 
     return $requested_package_line_items;
@@ -651,8 +688,8 @@ class FedEx extends ShippingMethodBase {
    * @return string
    *   The cleaned title.
    */
-  protected function getCleanTitle(ShipmentItem $shipment_item) {
-    $title = $shipment_item->getTitle();
+  protected function getCleanTitle(PackageInterface $package) {
+    $title = $package->getTitle();
     $title = preg_replace('/[^A-Za-z0-9 ]/', ' ', $title);
     $title = preg_replace('/ +/', ' ', $title);
 
@@ -843,19 +880,20 @@ class FedEx extends ShippingMethodBase {
    *
    * @param \NicholasCreativeMedia\FedExPHP\Structs\RequestedPackageLineItem $requested_package_line_item
    *   Te package line item to be adjusted.
-   * @param array $shipment_items
-   *   The shipment items in the package.
+   * @param array $packages
+   *   The packages.
    * @param \Drupal\commerce_shipping\Entity\ShipmentInterface $shipment
    *   The full shipment.
    *
    * @return \NicholasCreativeMedia\FedExPHP\Structs\RequestedPackageLineItem
    *   The adjusted line item.
    */
-  protected function adjustPackage(RequestedPackageLineItem $requested_package_line_item, array $shipment_items, ShipmentInterface $shipment) {
+  protected function adjustPackage(RequestedPackageLineItem $requested_package_line_item, array $packages, ShipmentInterface $shipment) {
+    // @TODO: Update plugins to use packages.
     foreach ($this->fedExServiceManager->getDefinitions() as $plugin_id => $definition) {
       /** @var \Drupal\commerce_fedex\Plugin\Commerce\FedEx\FedExPluginInterface $plugin */
       $plugin = $this->plugins->get($plugin_id);
-      $requested_package_line_item = $plugin->adjustPackage($requested_package_line_item, $shipment_items, $shipment);
+      $requested_package_line_item = $plugin->adjustPackage($requested_package_line_item, $packages, $shipment);
     }
     return $requested_package_line_item;
   }
