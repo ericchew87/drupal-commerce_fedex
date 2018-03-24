@@ -23,16 +23,41 @@ Please report bugs in the [issue queue]
 * A FedEx shipping account from [FedEx.com](http://www.fedex.com/)
 * Drupal 8
 * Drupal Commerce 2.x-dev (latest version)
-* Commerce Shipping 2.x-dev (latest version)
+* Commerce Shipping dev-shipping-packages (CUSTOM version)
 
 ## Installation
 
 Use [Composer](https://getcomposer.org/) to get Commerce FedEx and all of its
 dependencies installed on your Drupal 8 site:
 
+Make sure the following repositories exist in your composer.json:
+
 ```
-composer require drupal/commerce_fedex
+    "repositories": [
+        {
+            "type": "composer",
+            "url": "https://packages.drupal.org/8"
+        },
+        {
+            "type": "vcs",
+            "url": "https://github.com/ericchew87/commerce_shipping.git"
+        },
+        {
+            "type": "vcs",
+            "url": "https://github.com/ericchew87/drupal-commerce_fedex.git"
+        }
+    ],
 ```
+
+Then, require the custom forks of the commerce_fedex and commerce_shipping modules:
+
+```
+    "require": {
+        "drupal/commerce_shipping": "dev-shipping-packages",
+        "drupal/commerce_fedex": "dev-fedex-packages"
+    },
+```
+
 
 Then simply enable the "FedEx (Commerce Shipping)" module and visit 
 `Commerce > Configuration > Shipping Methods` to configure FedEx.
