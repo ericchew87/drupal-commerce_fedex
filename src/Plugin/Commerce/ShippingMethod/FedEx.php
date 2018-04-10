@@ -449,6 +449,7 @@ class FedEx extends ShippingMethodBase {
       return [];
     }
 
+    $shipment = clone $shipment;
     $this->packageShipment($shipment);
 
     $rate_service = $this->fedExRequest->getRateService($this->configuration);
